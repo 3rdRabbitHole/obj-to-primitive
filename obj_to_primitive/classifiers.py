@@ -200,6 +200,22 @@ def _compute_obb_dimensions(vertices, axes, center):
     return dimensions, obb_center_world
 
 
+def _pick_tighter_axes(candidate, fallback, verts, center):
+    """Return whichever axes produce a smaller OBB (by volume).
+
+    Used as a guard when face-normal-based refinement may produce
+    worse axes than PCA (e.g. beveled/rounded edges).
+    """
+    c_dims, _ = _compute_obb_dimensions(verts, candidate, center)
+    f_dims, _ = _compute_obb_dimensions(verts, fallback, center)
+    c_vol = np.prod(c_dims)
+    f_vol = np.prod(f_dims)
+    # Relative tolerance: treat volumes within 1e-6 as equal (prefer candidate)
+    if f_vol > 1e-20:
+        return candidate if c_vol <= f_vol * (1 + 1e-6) else fallback
+    return candidate if c_vol <= f_vol else fallback
+
+
 def _refine_axes_from_normals(obj, pca_axes):
     """
     Refine PCA axes using mesh face normals.
@@ -273,6 +289,179 @@ def _refine_axes_from_normals(obj, pca_axes):
         refined[2] = pca_axes[2]
 
     return refined
+
+
+def _find_box_axes_from_normals(obj):
+    """
+    Find 3 orthogonal face normal directions for box rotation correction.
+    Returns 3x3 axes array (rows are axes) or None if 3 orthogonal
+    directions cannot be found (e.g. hexagonal prisms, cylinders).
+    """
+    mesh = obj.data
+    mat = obj.matrix_world
+    normal_mat = mat.to_3x3().inverted().transposed()
+
+    if len(mesh.polygons) < 6:
+        return None
+
+    normals = []
+    areas = []
+    for poly in mesh.polygons:
+        n = normal_mat @ poly.normal
+        n_np = np.array([n.x, n.y, n.z], dtype=np.float64)
+        norm = np.linalg.norm(n_np)
+        if norm > 1e-10:
+            normals.append(n_np / norm)
+            areas.append(poly.area)
+
+    if len(normals) < 6:
+        return None
+
+    normals = np.array(normals)
+    areas = np.array(areas)
+
+    # Cluster normals by direction (treating ±n as same)
+    used = np.zeros(len(normals), dtype=bool)
+    clusters = []
+
+    for _ in range(20):
+        if used.all():
+            break
+        remaining_areas = areas.copy()
+        remaining_areas[used] = 0
+        if remaining_areas.max() < 1e-10:
+            break
+
+        seed_idx = np.argmax(remaining_areas)
+        seed_n = normals[seed_idx]
+
+        # Cluster: |dot| > cos(30deg) ~ 0.866
+        dots = np.abs(normals @ seed_n)
+        cluster_mask = (dots > 0.866) & (~used)
+        if not cluster_mask.any():
+            used[seed_idx] = True
+            continue
+
+        cluster_normals = normals[cluster_mask]
+        cluster_areas = areas[cluster_mask]
+
+        # Area-weighted average direction (align signs to seed)
+        signs = np.sign(cluster_normals @ seed_n)
+        signs[signs == 0] = 1
+        aligned = cluster_normals * signs[:, None]
+        avg_dir = (aligned * cluster_areas[:, None]).sum(axis=0)
+        norm_val = np.linalg.norm(avg_dir)
+        if norm_val > 1e-10:
+            avg_dir /= norm_val
+
+        clusters.append((avg_dir, cluster_areas.sum()))
+        used |= cluster_mask
+
+    if len(clusters) < 3:
+        return None
+
+    # Sort by area, try to find 3 orthogonal directions from top candidates
+    clusters.sort(key=lambda x: -x[1])
+    candidates = clusters[:min(8, len(clusters))]
+
+    from itertools import combinations
+    best_axes = None
+    best_area = 0
+
+    for combo in combinations(range(len(candidates)), 3):
+        dirs = [candidates[i][0] for i in combo]
+        total_area = sum(candidates[i][1] for i in combo)
+
+        # Orthogonality: |dot| < 0.15 for all pairs
+        d01 = abs(np.dot(dirs[0], dirs[1]))
+        d02 = abs(np.dot(dirs[0], dirs[2]))
+        d12 = abs(np.dot(dirs[1], dirs[2]))
+
+        if d01 < 0.15 and d02 < 0.15 and d12 < 0.15:
+            if total_area > best_area:
+                best_area = total_area
+                best_axes = np.array(dirs)
+
+    if best_axes is None:
+        return None
+
+    # Gram-Schmidt orthogonalization
+    best_axes[0] /= np.linalg.norm(best_axes[0])
+    best_axes[1] -= np.dot(best_axes[1], best_axes[0]) * best_axes[0]
+    n1 = np.linalg.norm(best_axes[1])
+    if n1 < 1e-10:
+        return None
+    best_axes[1] /= n1
+    best_axes[2] = np.cross(best_axes[0], best_axes[1])
+    n2 = np.linalg.norm(best_axes[2])
+    if n2 < 1e-10:
+        return None
+    best_axes[2] /= n2
+
+    return best_axes
+
+
+def _find_cylinder_axis_from_normals(obj):
+    """
+    Find cylinder axis direction from face normals.
+    The cylinder axis is perpendicular to side face normals.
+    Uses area-weighted PCA on normals: smallest eigenvector = axis direction.
+    Returns unit vector or None.
+    """
+    mesh = obj.data
+    mat = obj.matrix_world
+    normal_mat = mat.to_3x3().inverted().transposed()
+
+    if len(mesh.polygons) < 6:
+        return None
+
+    normals = []
+    areas = []
+    for poly in mesh.polygons:
+        n = normal_mat @ poly.normal
+        n_np = np.array([n.x, n.y, n.z], dtype=np.float64)
+        norm = np.linalg.norm(n_np)
+        if norm > 1e-10:
+            normals.append(n_np / norm)
+            areas.append(poly.area)
+
+    if len(normals) < 6:
+        return None
+
+    normals = np.array(normals)
+    areas = np.array(areas)
+
+    # --- First pass: area-weighted PCA on ALL normals for rough axis ---
+    weights = areas / areas.sum()
+    weighted = normals * np.sqrt(weights[:, None])
+    cov = weighted.T @ weighted
+
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    rough_axis = eigenvectors[:, 0].copy()
+
+    # --- Second pass: filter out cap faces, redo PCA with side faces only ---
+    dots_rough = np.abs(normals @ rough_axis)
+    side_mask = dots_rough < 0.866  # faces > 30° from axis = side faces
+    side_normals = normals[side_mask]
+    side_areas = areas[side_mask]
+
+    if len(side_normals) >= 3 and side_areas.sum() > 1e-10:
+        sw = side_areas / side_areas.sum()
+        side_weighted = side_normals * np.sqrt(sw[:, None])
+        side_cov = side_weighted.T @ side_weighted
+        side_evals, side_evecs = np.linalg.eigh(side_cov)
+        axis = side_evecs[:, 0].copy()
+    else:
+        axis = rough_axis
+
+    # Verify: most area should be perpendicular to this axis (side faces)
+    dots = np.abs(normals @ axis)
+    perp_area = np.sum((dots < 0.3) * areas) / areas.sum()
+
+    if perp_area < 0.4:
+        return None
+
+    return axis
 
 
 def _compute_mesh_volume(obj):
@@ -663,10 +852,11 @@ def classify_pca(obj, settings):
     center, pca_axes, eigenvalues = _pca(verts)
     pca_axes_raw = pca_axes.copy()  # save before refinement
 
-    # Always refine axes from face normals — PCA axes can be diagonal
+    # Refine axes from face normals — PCA axes can be diagonal
     # on low-vertex shapes (e.g. 8-vertex cubes), causing OBB misalignment.
-    # The refinement function falls back to PCA axes when normals don't help.
-    axes = _refine_axes_from_normals(obj, pca_axes)
+    # Guard: keep refinement only when it produces a tighter OBB.
+    refined_axes = _refine_axes_from_normals(obj, pca_axes)
+    axes = _pick_tighter_axes(refined_axes, pca_axes, verts, center)
 
     # Volume ratio check for complex/organic shapes
     vol_ratio = _compute_volume_ratio(obj, axes, center, verts)
@@ -803,32 +993,152 @@ def classify_pca(obj, settings):
                 shape = ShapeType.SPHERE
                 confidence = sphere_inlier
 
+    # Cylinder fallback: when eigenvalue ratios led to BOX but
+    # cross-section shape is clearly circular (high iso_ratio).
+    # Catches hollow cylinders and non-uniform vertex distributions
+    # where eigenvalue-based circularity is misleading.
+    if shape == ShapeType.BOX and enough_for_cylinder:
+        for ax_idx, cs in [(0, cross_section_0), (1, cross_section_1),
+                           (2, cross_section_2)]:
+            iso = _cross_section_iso_ratio(cs)
+            if iso >= 0.95:
+                shape = ShapeType.CYLINDER
+                confidence = iso
+                cylinder_axis_idx = ax_idx
+                break
+
     # Low confidence -> unknown
     if confidence < 0.4:
         shape = ShapeType.UNKNOWN
 
     # Reorder axes so cylinder symmetry axis maps to Z (primitive depth axis).
-    # PCA sorts eigenvalues descending, so tall cylinders have their axis at
-    # index 0. The primitive is created with depth=dims[2], so we need the
-    # cylinder axis in position 2. Reordering [1,2,0] preserves right-handedness.
-    if shape == ShapeType.CYLINDER and cylinder_axis_idx == 0:
-        axes = axes[[1, 2, 0]]
-        dims = dims[[1, 2, 0]]
+    if shape == ShapeType.CYLINDER and cylinder_axis_idx is not None:
+        if cylinder_axis_idx == 0:
+            axes = axes[[1, 2, 0]]
+            dims = dims[[1, 2, 0]]
+        elif cylinder_axis_idx == 1:
+            axes = axes[[0, 2, 1]]
+            dims = dims[[0, 2, 1]]
+        # cylinder_axis_idx == 2: already in correct position
 
-    # Minimize spurious rotation from PCA axis ambiguity.
-    # Try both refined axes and raw PCA axes, pick whichever
-    # produces rotation closest to the object's own orientation.
-    # Refined axes help low-vertex shapes (cubes); raw PCA axes
-    # are better when refinement is misled by bevel normals.
+    # --- Rotation correction using face normals ---
     ref_rot = obj.matrix_world.to_3x3()
 
-    # Apply same cylinder reordering to raw PCA axes
-    pca_raw_for_min = pca_axes_raw.copy()
-    if shape == ShapeType.CYLINDER and cylinder_axis_idx == 0:
-        pca_raw_for_min = pca_raw_for_min[[1, 2, 0]]
+    if shape == ShapeType.BOX:
+        # Face-normal-based axes: find 3 orthogonal normal pairs.
+        # More accurate than PCA when chamfers/bevels bias vertex
+        # distribution. Falls back to PCA when normals don't form
+        # 3 orthogonal pairs (e.g. hexagonal prisms).
+        box_axes = _find_box_axes_from_normals(obj)
+        # Guard: reject normal-based axes when they produce a larger OBB
+        # (beveled/rounded edges can mislead normal clustering).
+        if box_axes is not None:
+            if _pick_tighter_axes(box_axes, axes, verts, center) is not box_axes:
+                box_axes = None
+        if box_axes is not None:
+            axes = box_axes
+            dims, obb_center = _compute_obb_dimensions(verts, axes, center)
+            # Full permutation + sign correction: box normal axes give
+            # correct directions but in arbitrary order — permutation
+            # re-orders them to match the object's local frame.
+            from mathutils import Quaternion
+            from itertools import permutations as _perms
+            if ref_rot is not None:
+                ref_quat = ref_rot.to_quaternion()
+            else:
+                ref_quat = Quaternion()
+            SIGN_COMBOS = [(1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1)]
+            best_angle = float('inf')
+            best_axes = axes.copy()
+            for perm in _perms(range(3)):
+                for signs in SIGN_COMBOS:
+                    sa = np.zeros_like(axes)
+                    for k in range(3):
+                        sa[k] = axes[perm[k]] * signs[k]
+                    if np.linalg.det(sa) < 0:
+                        sa[2] = -sa[2]
+                    euler = _axes_to_euler(sa)
+                    cand_quat = euler.to_quaternion()
+                    angle = ref_quat.rotation_difference(cand_quat).angle
+                    if angle < best_angle:
+                        best_angle = angle
+                        best_axes = sa.copy()
+            axes = best_axes
+            dims, obb_center = _compute_obb_dimensions(verts, axes, center)
+        else:
+            # Fallback: compare refined vs raw PCA axes
+            pca_raw_for_min = pca_axes_raw.copy()
+            axes, dims = _pick_best_axes(
+                axes, dims, pca_raw_for_min, verts, center, ref_rot)
 
-    axes, dims = _pick_best_axes(
-        axes, dims, pca_raw_for_min, verts, center, ref_rot)
+    elif shape == ShapeType.CYLINDER:
+        # Face-normal-based axis direction for cylinder.
+        # More accurate when vertex distribution is non-uniform.
+        cyl_axis_dir = _find_cylinder_axis_from_normals(obj)
+        if cyl_axis_dir is not None:
+            ax2_candidate = cyl_axis_dir / np.linalg.norm(cyl_axis_dir)
+            # Consistency check: normal-based axis must agree with
+            # cross-section-based axis (axes[2] after reordering).
+            # If they diverge (>45°), discard the normal result.
+            agreement = abs(np.dot(ax2_candidate, axes[2]))
+            if agreement >= 0.707:  # cos(45°)
+                ax2 = ax2_candidate
+                # Build cross-section axes from ref_rot, not from
+                # PCA/refined axes which can be tilted by polygon
+                # face normals.  The cross-section is circular, so
+                # any in-plane orientation is geometrically equivalent;
+                # aligning with the object's own rotation is cleanest.
+                ref_np = np.array(ref_rot) if ref_rot is not None \
+                    else np.eye(3)
+                ax0 = ref_np[:, 0] - np.dot(ref_np[:, 0], ax2) * ax2
+                n0 = np.linalg.norm(ax0)
+                if n0 > 1e-10:
+                    ax0 /= n0
+                else:
+                    # ref X is parallel to cylinder axis; use ref Y
+                    ax0 = ref_np[:, 1] - np.dot(ref_np[:, 1], ax2) * ax2
+                    n0 = np.linalg.norm(ax0)
+                    if n0 > 1e-10:
+                        ax0 /= n0
+                    else:
+                        ref_vec = np.array([1.0, 0, 0]) if abs(ax2[0]) < 0.9 \
+                            else np.array([0, 1.0, 0])
+                        ax0 = np.cross(ax2, ref_vec)
+                        ax0 /= np.linalg.norm(ax0)
+                ax1 = np.cross(ax2, ax0)
+                ax1 /= np.linalg.norm(ax1)
+                axes = np.array([ax0, ax1, ax2])
+                dims, obb_center = _compute_obb_dimensions(verts, axes, center)
+        # Sign-only correction for cylinder: flip axis pairs so each
+        # axis points toward the reference direction.  No permutation —
+        # axis[2] must stay the cylinder axis.
+        from mathutils import Quaternion
+        if ref_rot is not None:
+            ref_quat = ref_rot.to_quaternion()
+        else:
+            ref_quat = Quaternion()
+        SIGN_COMBOS = [(1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1)]
+        best_angle = float('inf')
+        best_axes = axes.copy()
+        for signs in SIGN_COMBOS:
+            sa = axes.copy()
+            for k in range(3):
+                sa[k] *= signs[k]
+            euler = _axes_to_euler(sa)
+            cand_quat = euler.to_quaternion()
+            angle = ref_quat.rotation_difference(cand_quat).angle
+            if angle < best_angle:
+                best_angle = angle
+                best_axes = sa.copy()
+        axes = best_axes
+        dims, obb_center = _compute_obb_dimensions(verts, axes, center)
+
+    else:
+        # SPHERE, UNKNOWN: compare refined vs raw PCA axes
+        pca_raw_for_min = pca_axes_raw.copy()
+        axes, dims = _pick_best_axes(
+            axes, dims, pca_raw_for_min, verts, center, ref_rot)
+
     euler = _axes_to_euler(axes)
 
     return ClassificationResult(
@@ -950,7 +1260,11 @@ def _ransac_fit_box(points, obj=None, n_iterations=50, threshold=None):
     Returns inlier ratio (points close to box surfaces).
     """
     center, pca_axes, eigenvalues = _pca(points)
-    axes = _refine_axes_from_normals(obj, pca_axes) if obj else pca_axes
+    if obj is not None:
+        refined = _refine_axes_from_normals(obj, pca_axes)
+        axes = _pick_tighter_axes(refined, pca_axes, points, center)
+    else:
+        axes = pca_axes
     dims, obb_center = _compute_obb_dimensions(points, axes, center)
 
     if threshold is None:
@@ -999,7 +1313,8 @@ def classify_ransac(obj, settings):
         )
 
     center, pca_axes, eigenvalues = _pca(verts)
-    axes = _refine_axes_from_normals(obj, pca_axes)
+    refined_axes = _refine_axes_from_normals(obj, pca_axes)
+    axes = _pick_tighter_axes(refined_axes, pca_axes, verts, center)
     dims, obb_center = _compute_obb_dimensions(verts, axes, center)
     euler = _axes_to_euler(axes)
 
