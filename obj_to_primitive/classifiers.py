@@ -1,13 +1,33 @@
 """
 Shape classification algorithms for Object to Primitive addon.
 Supports PCA, RANSAC (experimental), and Hybrid (experimental) methods.
+
+Performance notes
+-----------------
+- Vertex extraction uses ``foreach_get`` + numpy batch matrix multiply
+  instead of per-vertex ``matrix_world @ v.co`` loops.
+- Face normals are extracted once (``_get_face_normals_world``) and shared
+  across all functions that need them, avoiding repeated polygon iteration.
+
+Design notes
+------------
+- ``sample_count`` (default 2000) sub-samples vertices for PCA eigenvalue
+  analysis only.  Volume ratio, face normals, and OBB computation always
+  use the **full** mesh so that orientation and bounding box remain exact.
+  This is intentional: PCA eigenvalues converge quickly with fewer samples,
+  but OBB tightness and normal clustering degrade with sampling.
+- RANSAC and Hybrid classifiers are experimental.  They do **not** include
+  the face-normal rotation correction that the PCA path uses, so their
+  output rotations may be less accurate on symmetric shapes.  Use PCA for
+  production work.
 """
 
 import numpy as np
-from mathutils import Vector, Matrix
+from mathutils import Vector, Matrix, Quaternion
 from enum import Enum
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
+from itertools import permutations as _perms
 
 
 class ShapeType(Enum):
@@ -29,17 +49,74 @@ class ClassificationResult:
 
 
 def _get_vertices_world(obj, sample_count=0):
-    """Extract world-space vertex positions, optionally subsampled."""
-    mesh = obj.data
-    mat = obj.matrix_world
+    """Extract world-space vertex positions, optionally subsampled.
 
-    verts = np.array([mat @ v.co for v in mesh.vertices], dtype=np.float64)
+    Uses ``foreach_get`` for bulk extraction and numpy matrix multiply
+    for the world-space transform — significantly faster than per-vertex
+    ``matrix_world @ v.co`` on meshes with >100 vertices.
+    """
+    mesh = obj.data
+    n = len(mesh.vertices)
+    if n == 0:
+        return np.empty((0, 3), dtype=np.float64)
+
+    # Bulk extract local coords via foreach_get
+    coords = np.empty(n * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", coords)
+    local = coords.reshape(n, 3)
+
+    # Batch world transform: v_world = v_local @ M^T + t
+    mat = np.array(obj.matrix_world, dtype=np.float64)  # 4x4
+    rot_scale = mat[:3, :3].T  # transpose for row-vector multiply
+    translation = mat[:3, 3]
+    verts = local @ rot_scale + translation
 
     if sample_count > 0 and len(verts) > sample_count:
         indices = np.random.choice(len(verts), sample_count, replace=False)
         verts = verts[indices]
 
     return verts
+
+
+def _get_face_normals_world(obj):
+    """Extract world-space face normals and areas for all polygons.
+
+    Returns ``(normals, areas)`` where normals is (N, 3) unit vectors
+    and areas is (N,) polygon areas, or ``(None, None)`` when the mesh
+    has no polygons.  Both arrays exclude degenerate zero-area faces.
+
+    Uses ``foreach_get`` for bulk extraction.
+    """
+    mesh = obj.data
+    n_poly = len(mesh.polygons)
+    if n_poly == 0:
+        return None, None
+
+    # Bulk extract local normals and areas
+    raw_normals = np.empty(n_poly * 3, dtype=np.float64)
+    mesh.polygons.foreach_get("normal", raw_normals)
+    local_normals = raw_normals.reshape(n_poly, 3)
+
+    raw_areas = np.empty(n_poly, dtype=np.float64)
+    mesh.polygons.foreach_get("area", raw_areas)
+
+    # Transform normals to world space: n_world = (M^-T) @ n_local
+    mat3 = obj.matrix_world.to_3x3()
+    normal_mat = np.array(mat3.inverted_safe().transposed(), dtype=np.float64)
+    world_normals = local_normals @ normal_mat.T  # (N,3) @ (3,3)
+
+    # Normalize
+    norms = np.linalg.norm(world_normals, axis=1, keepdims=True)
+    valid = (norms.ravel() > 1e-10)
+    if not valid.any():
+        return None, None
+
+    world_normals = world_normals[valid]
+    norms = norms[valid]
+    world_normals /= norms
+    areas = raw_areas[valid]
+
+    return world_normals, areas
 
 
 def _pca(vertices):
@@ -216,35 +293,20 @@ def _pick_tighter_axes(candidate, fallback, verts, center):
     return candidate if c_vol <= f_vol else fallback
 
 
-def _refine_axes_from_normals(obj, pca_axes):
+def _refine_axes_from_normals(obj, pca_axes, normals=None, areas=None):
     """
     Refine PCA axes using mesh face normals.
     For each PCA axis, find the face normal most aligned with it.
     This fixes PCA instability on symmetric shapes (cubes, etc).
+
+    If *normals* and *areas* are provided they are used directly
+    (avoids re-extracting them).  Otherwise they are computed from *obj*.
     """
-    mesh = obj.data
-    mat = obj.matrix_world
-    normal_mat = mat.to_3x3().inverted().transposed()
+    if normals is None or areas is None:
+        normals, areas = _get_face_normals_world(obj)
 
-    if len(mesh.polygons) == 0:
+    if normals is None or len(normals) == 0:
         return pca_axes
-
-    # Collect world-space face normals weighted by face area
-    normals = []
-    areas = []
-    for poly in mesh.polygons:
-        n = normal_mat @ poly.normal
-        n_np = np.array([n.x, n.y, n.z], dtype=np.float64)
-        norm = np.linalg.norm(n_np)
-        if norm > 1e-10:
-            normals.append(n_np / norm)
-            areas.append(poly.area)
-
-    if len(normals) == 0:
-        return pca_axes
-
-    normals = np.array(normals)
-    areas = np.array(areas)
 
     # For each PCA axis, find the normal most aligned with it
     # Weight by face area so large faces (main box faces) dominate over small bevel faces
@@ -291,34 +353,17 @@ def _refine_axes_from_normals(obj, pca_axes):
     return refined
 
 
-def _find_box_axes_from_normals(obj):
+def _find_box_axes_from_normals(obj, normals=None, areas=None):
     """
     Find 3 orthogonal face normal directions for box rotation correction.
     Returns 3x3 axes array (rows are axes) or None if 3 orthogonal
     directions cannot be found (e.g. hexagonal prisms, cylinders).
     """
-    mesh = obj.data
-    mat = obj.matrix_world
-    normal_mat = mat.to_3x3().inverted().transposed()
+    if normals is None or areas is None:
+        normals, areas = _get_face_normals_world(obj)
 
-    if len(mesh.polygons) < 6:
+    if normals is None or len(normals) < 6:
         return None
-
-    normals = []
-    areas = []
-    for poly in mesh.polygons:
-        n = normal_mat @ poly.normal
-        n_np = np.array([n.x, n.y, n.z], dtype=np.float64)
-        norm = np.linalg.norm(n_np)
-        if norm > 1e-10:
-            normals.append(n_np / norm)
-            areas.append(poly.area)
-
-    if len(normals) < 6:
-        return None
-
-    normals = np.array(normals)
-    areas = np.array(areas)
 
     # Cluster normals by direction (treating ±n as same)
     used = np.zeros(len(normals), dtype=bool)
@@ -364,7 +409,7 @@ def _find_box_axes_from_normals(obj):
     clusters.sort(key=lambda x: -x[1])
     candidates = clusters[:min(8, len(clusters))]
 
-    from itertools import combinations
+    from itertools import combinations  # stdlib — fast, kept local for clarity
     best_axes = None
     best_area = 0
 
@@ -401,35 +446,18 @@ def _find_box_axes_from_normals(obj):
     return best_axes
 
 
-def _find_cylinder_axis_from_normals(obj):
+def _find_cylinder_axis_from_normals(obj, normals=None, areas=None):
     """
     Find cylinder axis direction from face normals.
     The cylinder axis is perpendicular to side face normals.
     Uses area-weighted PCA on normals: smallest eigenvector = axis direction.
     Returns unit vector or None.
     """
-    mesh = obj.data
-    mat = obj.matrix_world
-    normal_mat = mat.to_3x3().inverted().transposed()
+    if normals is None or areas is None:
+        normals, areas = _get_face_normals_world(obj)
 
-    if len(mesh.polygons) < 6:
+    if normals is None or len(normals) < 6:
         return None
-
-    normals = []
-    areas = []
-    for poly in mesh.polygons:
-        n = normal_mat @ poly.normal
-        n_np = np.array([n.x, n.y, n.z], dtype=np.float64)
-        norm = np.linalg.norm(n_np)
-        if norm > 1e-10:
-            normals.append(n_np / norm)
-            areas.append(poly.area)
-
-    if len(normals) < 6:
-        return None
-
-    normals = np.array(normals)
-    areas = np.array(areas)
 
     # --- First pass: area-weighted PCA on ALL normals for rough axis ---
     weights = areas / areas.sum()
@@ -480,14 +508,20 @@ def _compute_mesh_volume(obj):
     shapes, and a higher ratio means fewer false UNKNOWN results.
     """
     import bmesh
+    from mathutils import Vector as _Vec
 
-    mat = obj.matrix_world
     mesh = obj.data
-    world_verts = [mat @ mesh.vertices[vi].co for vi in range(len(mesh.vertices))]
+    n = len(mesh.vertices)
+    # Bulk extract and transform (reuse the same approach as _get_vertices_world)
+    coords = np.empty(n * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", coords)
+    local = coords.reshape(n, 3)
+    mat = np.array(obj.matrix_world, dtype=np.float64)
+    world_verts = local @ mat[:3, :3].T + mat[:3, 3]
 
     bm = bmesh.new()
-    for co in world_verts:
-        bm.verts.new(co)
+    for i in range(n):
+        bm.verts.new(_Vec(world_verts[i]))
     bm.verts.ensure_lookup_table()
 
     bmesh.ops.convex_hull(bm, input=bm.verts)
@@ -553,7 +587,7 @@ def _check_sphere_surface(verts):
     return inlier_ratio > 0.8, float(inlier_ratio)
 
 
-def _face_normal_spread(obj):
+def _face_normal_spread(obj, normals=None, areas=None):
     """
     Measure how spread out face normals are.
     Returns a value 0-1:
@@ -567,28 +601,12 @@ def _face_normal_spread(obj):
     Sphere: many directions, no dominant cluster.
     Box: ~6 dominant clusters (or 3 pairs of opposite faces).
     """
-    mesh = obj.data
-    mat = obj.matrix_world
-    normal_mat = mat.to_3x3().inverted().transposed()
+    if normals is None or areas is None:
+        normals, areas = _get_face_normals_world(obj)
 
-    if len(mesh.polygons) == 0:
+    if normals is None or len(normals) < 4:
         return 0.5
 
-    normals = []
-    areas = []
-    for poly in mesh.polygons:
-        n = normal_mat @ poly.normal
-        n_np = np.array([n.x, n.y, n.z], dtype=np.float64)
-        norm = np.linalg.norm(n_np)
-        if norm > 1e-10:
-            normals.append(n_np / norm)
-            areas.append(poly.area)
-
-    if len(normals) < 4:
-        return 0.5
-
-    normals = np.array(normals)
-    areas = np.array(areas)
     total_area = areas.sum()
     if total_area < 1e-10:
         return 0.5
@@ -704,7 +722,6 @@ def _minimize_rotation(axes, dims, ref_matrix=None):
         picks the combination closest to this orientation (measured as
         quaternion angle).  When None, minimises from identity.
     """
-    from mathutils import Quaternion
 
     # Right-handed sign combos: flip any two axes at once
     SIGN_COMBOS = [(1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1)]
@@ -837,9 +854,15 @@ def classify_pca(obj, settings):
     2. Eigenvalue ratios to narrow candidates
     3. Circularity test on cross-sections to distinguish round vs rectangular
     """
-    verts = _get_vertices_world(obj, settings.sample_count)
+    # Full vertex set for OBB / normals; sub-sampled set for PCA only.
+    verts_full = _get_vertices_world(obj, sample_count=0)
+    if settings.sample_count > 0 and len(verts_full) > settings.sample_count:
+        idx = np.random.choice(len(verts_full), settings.sample_count, replace=False)
+        verts_pca = verts_full[idx]
+    else:
+        verts_pca = verts_full
 
-    if len(verts) < 4:
+    if len(verts_full) < 4:
         return ClassificationResult(
             shape_type=ShapeType.UNKNOWN,
             position=tuple(obj.location),
@@ -849,20 +872,27 @@ def classify_pca(obj, settings):
             method='PCA',
         )
 
-    center, pca_axes, eigenvalues = _pca(verts)
+    # Extract face normals once — shared by all downstream functions
+    face_normals, face_areas = _get_face_normals_world(obj)
+
+    center, pca_axes, eigenvalues = _pca(verts_pca)
     pca_axes_raw = pca_axes.copy()  # save before refinement
+
+    # Use full verts for OBB and all spatial queries
+    verts = verts_full
 
     # Refine axes from face normals — PCA axes can be diagonal
     # on low-vertex shapes (e.g. 8-vertex cubes), causing OBB misalignment.
     # Guard: keep refinement only when it produces a tighter OBB.
-    refined_axes = _refine_axes_from_normals(obj, pca_axes)
+    refined_axes = _refine_axes_from_normals(obj, pca_axes,
+                                              normals=face_normals, areas=face_areas)
     axes = _pick_tighter_axes(refined_axes, pca_axes, verts, center)
 
     # Volume ratio check for complex/organic shapes
     vol_ratio = _compute_volume_ratio(obj, axes, center, verts)
     if vol_ratio < settings.complexity_threshold:
         dims, obb_center = _compute_obb_dimensions(verts, axes, center)
-        ref_rot = obj.matrix_world.to_3x3()
+        ref_rot = obj.matrix_world.to_3x3().normalized()
         axes, dims = _pick_best_axes(
             axes, dims, pca_axes_raw, verts, center, ref_rot)
         euler = _axes_to_euler(axes)
@@ -922,7 +952,7 @@ def classify_pca(obj, settings):
 
     # Face normal spread — distinguishes sphere (many directions)
     # from rounded box (few dominant clusters)
-    normal_spread = _face_normal_spread(obj)
+    normal_spread = _face_normal_spread(obj, normals=face_normals, areas=face_areas)
 
     # Classification logic using inter-eigenvalue ratios
     # Sphere surface check is used ONLY as confirmation after circularity
@@ -1022,14 +1052,15 @@ def classify_pca(obj, settings):
         # cylinder_axis_idx == 2: already in correct position
 
     # --- Rotation correction using face normals ---
-    ref_rot = obj.matrix_world.to_3x3()
+    # .normalized() strips non-uniform scale so ref_rot is a pure rotation.
+    ref_rot = obj.matrix_world.to_3x3().normalized()
 
     if shape == ShapeType.BOX:
         # Face-normal-based axes: find 3 orthogonal normal pairs.
         # More accurate than PCA when chamfers/bevels bias vertex
         # distribution. Falls back to PCA when normals don't form
         # 3 orthogonal pairs (e.g. hexagonal prisms).
-        box_axes = _find_box_axes_from_normals(obj)
+        box_axes = _find_box_axes_from_normals(obj, normals=face_normals, areas=face_areas)
         # Guard: reject normal-based axes when they produce a larger OBB
         # (beveled/rounded edges can mislead normal clustering).
         if box_axes is not None:
@@ -1041,8 +1072,6 @@ def classify_pca(obj, settings):
             # Full permutation + sign correction: box normal axes give
             # correct directions but in arbitrary order — permutation
             # re-orders them to match the object's local frame.
-            from mathutils import Quaternion
-            from itertools import permutations as _perms
             if ref_rot is not None:
                 ref_quat = ref_rot.to_quaternion()
             else:
@@ -1074,7 +1103,7 @@ def classify_pca(obj, settings):
     elif shape == ShapeType.CYLINDER:
         # Face-normal-based axis direction for cylinder.
         # More accurate when vertex distribution is non-uniform.
-        cyl_axis_dir = _find_cylinder_axis_from_normals(obj)
+        cyl_axis_dir = _find_cylinder_axis_from_normals(obj, normals=face_normals, areas=face_areas)
         if cyl_axis_dir is not None:
             ax2_candidate = cyl_axis_dir / np.linalg.norm(cyl_axis_dir)
             # Consistency check: normal-based axis must agree with
@@ -1112,7 +1141,6 @@ def classify_pca(obj, settings):
         # Sign-only correction for cylinder: flip axis pairs so each
         # axis points toward the reference direction.  No permutation —
         # axis[2] must stay the cylinder axis.
-        from mathutils import Quaternion
         if ref_rot is not None:
             ref_quat = ref_rot.to_quaternion()
         else:
@@ -1277,20 +1305,12 @@ def _ransac_fit_box(points, obj=None, n_iterations=50, threshold=None):
 
     half = dims / 2.0
 
-    # Distance to nearest box face
-    n = len(points)
-    face_dists = np.zeros(n)
-    for i in range(n):
-        p = local[i]
-        # Distance to each of 6 faces
-        d = np.array([
-            abs(abs(p[0]) - half[0]),
-            abs(abs(p[1]) - half[1]),
-            abs(abs(p[2]) - half[2]),
-        ])
-        face_dists[i] = np.min(d)
+    # Distance to nearest box face — vectorized
+    # For each point, distance to the closest of 6 faces is
+    # min over axes of | |coord| - half_extent |
+    face_dists = np.min(np.abs(np.abs(local) - half), axis=1)
 
-    inlier_ratio = np.sum(face_dists < threshold) / n
+    inlier_ratio = np.sum(face_dists < threshold) / len(points)
     return inlier_ratio
 
 
@@ -1298,7 +1318,10 @@ def classify_ransac(obj, settings):
     """
     RANSAC-based shape classification (experimental).
     Fits sphere, cylinder, and box, picks the best inlier ratio.
-    Missing iso_ratio guard and rotation minimization — less accurate than PCA.
+
+    NOTE: This classifier does **not** include the face-normal rotation
+    correction that PCA uses, so output rotations may be less accurate
+    on symmetric shapes.  Use PCA for production work.
     """
     verts = _get_vertices_world(obj, settings.sample_count)
 
@@ -1312,8 +1335,11 @@ def classify_ransac(obj, settings):
             method='RANSAC',
         )
 
+    face_normals, face_areas = _get_face_normals_world(obj)
+
     center, pca_axes, eigenvalues = _pca(verts)
-    refined_axes = _refine_axes_from_normals(obj, pca_axes)
+    refined_axes = _refine_axes_from_normals(obj, pca_axes,
+                                              normals=face_normals, areas=face_areas)
     axes = _pick_tighter_axes(refined_axes, pca_axes, verts, center)
     dims, obb_center = _compute_obb_dimensions(verts, axes, center)
     euler = _axes_to_euler(axes)
@@ -1341,7 +1367,7 @@ def classify_ransac(obj, settings):
         # Penalize sphere score when face normals indicate box-like geometry.
         # Rounded/beveled boxes have high sphere inlier ratio but few normal
         # directions; true spheres have normals pointing in many directions.
-        normal_spread = _face_normal_spread(obj)
+        normal_spread = _face_normal_spread(obj, normals=face_normals, areas=face_areas)
         sphere_score = sphere_result[2]
         if normal_spread < 0.4:
             # Box-like normal distribution → heavily penalize sphere fit
@@ -1411,7 +1437,10 @@ def classify_ransac(obj, settings):
 def classify_hybrid(obj, settings):
     """
     Hybrid (experimental): PCA for quick pre-filter, RANSAC for verification.
-    Inherits RANSAC limitations when PCA confidence is low.
+
+    When PCA confidence is high (>0.8), uses PCA result directly and benefits
+    from full rotation correction.  When confidence is low, falls back to
+    RANSAC which lacks rotation correction — see ``classify_ransac`` note.
     """
     pca_result = classify_pca(obj, settings)
 
