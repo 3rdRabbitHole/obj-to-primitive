@@ -14,6 +14,28 @@ Useful for reducing high-poly meshes (e.g. CAD imports) into lightweight proxy g
 - **Customizable colors** — change the preview color for each shape type in the Primitive Color panel
 - **Experimental classifiers** — RANSAC and Hybrid methods available for testing
 
+## Demo
+
+### Basic Usage
+Select objects → Preview → Confirm
+
+![Basic Usage](doc/01_basic_usage.gif)
+
+### Practical Example
+Preview mode allows editing primitives to better match the original shape
+
+![Practical Example](doc/02_practical_example.gif)
+
+### Unknown Modes
+UNKNOWN shapes can use Box or Convex Hull as fallback
+
+![Unknown Modes](doc/03_unknown_modes.gif)
+
+### Exclude Feature
+Exclude specific objects from conversion during preview
+
+![Exclude Feature](doc/04_exclude_feature.gif)
+
 ## Requirements
 
 - Blender 4.2 or later
