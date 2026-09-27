@@ -33,8 +33,12 @@ def _schedule_preview_rebuild(shape_types):
 
 
 def _rebuild_preview_primitives(shape_types):
-    """Delete and recreate preview primitives for the given shape types."""
-    from .classifiers import classify, ShapeType
+    """Delete and recreate preview primitives for the given shape types.
+
+    Uses cached classification data from custom properties to avoid
+    re-running classify(), which is the main performance bottleneck.
+    """
+    from .classifiers import ShapeType
     from .operators import (
         PREVIEW_PREFIX, _create_primitive_mesh,
         _create_convex_hull_mesh, _setup_preview_material,
@@ -48,59 +52,76 @@ def _rebuild_preview_primitives(shape_types):
         return
 
     # Find preview objects matching the requested shape types
+    # and read cached data BEFORE deleting them
     to_rebuild = []
     for obj in list(bpy.data.objects):
         if not obj.name.startswith(PREVIEW_PREFIX):
             continue
         obj_shape = obj.get("_o2p_shape", "")
         if obj_shape in shape_types:
-            original_name = obj.get("_o2p_original", "")
-            to_rebuild.append((obj, original_name, obj_shape))
+            cached = {
+                "original_name": obj.get("_o2p_original", ""),
+                "shape": obj_shape,
+                "confidence": obj.get("_o2p_confidence", 0.0),
+                "method": obj.get("_o2p_method", ""),
+                "position": list(obj.get("_o2p_position", [0, 0, 0])),
+                "rotation": list(obj.get("_o2p_rotation", [0, 0, 0])),
+                "dimensions": list(obj.get("_o2p_dimensions", [1, 1, 1])),
+            }
+            to_rebuild.append((obj, cached))
 
     if not to_rebuild:
         return
 
     # Delete old previews
     bpy.ops.object.select_all(action='DESELECT')
-    for obj, _, _ in to_rebuild:
+    for obj, _ in to_rebuild:
         mesh_data = obj.data
         bpy.data.objects.remove(obj, do_unlink=True)
         if mesh_data and mesh_data.users == 0:
             bpy.data.meshes.remove(mesh_data)
 
-    # Recreate
-    for _, original_name, _ in to_rebuild:
-        if original_name not in bpy.data.objects:
-            continue
+    # Recreate from cached data — no classify() call
+    for _, cached in to_rebuild:
+        original_name = cached["original_name"]
+        shape_str = cached["shape"]
 
-        orig_obj = bpy.data.objects[original_name]
-        result = classify(orig_obj, settings)
+        try:
+            shape_type = ShapeType(shape_str)
+        except ValueError:
+            shape_type = ShapeType.UNKNOWN
 
         bpy.ops.object.select_all(action='DESELECT')
 
-        if (result.shape_type == ShapeType.UNKNOWN
+        if (shape_type == ShapeType.UNKNOWN
                 and settings.unknown_mode == 'CONVEX_HULL'):
+            if original_name not in bpy.data.objects:
+                continue
+            orig_obj = bpy.data.objects[original_name]
             prim_obj = _create_convex_hull_mesh(orig_obj)
         else:
             prim_obj = _create_primitive_mesh(
-                result.shape_type, result.dimensions, settings)
+                shape_type, cached["dimensions"], settings)
 
         if prim_obj is None:
             continue
 
-        is_convex_hull = (result.shape_type == ShapeType.UNKNOWN
+        is_convex_hull = (shape_type == ShapeType.UNKNOWN
                           and settings.unknown_mode == 'CONVEX_HULL')
         if not is_convex_hull:
-            prim_obj.location = result.position
-            prim_obj.rotation_euler = Euler(result.rotation)
+            prim_obj.location = cached["position"]
+            prim_obj.rotation_euler = Euler(cached["rotation"])
 
         prim_obj.name = f"{PREVIEW_PREFIX}{original_name}"
         prim_obj["_o2p_original"] = original_name
-        prim_obj["_o2p_shape"] = result.shape_type.value
-        prim_obj["_o2p_confidence"] = float(result.confidence)
-        prim_obj["_o2p_method"] = result.method
+        prim_obj["_o2p_shape"] = shape_str
+        prim_obj["_o2p_confidence"] = float(cached["confidence"])
+        prim_obj["_o2p_method"] = cached["method"]
+        prim_obj["_o2p_position"] = cached["position"]
+        prim_obj["_o2p_rotation"] = cached["rotation"]
+        prim_obj["_o2p_dimensions"] = cached["dimensions"]
 
-        _setup_preview_material(prim_obj, result.shape_type, settings.preview_opacity)
+        _setup_preview_material(prim_obj, shape_type, settings.preview_opacity)
 
 
 # --- Update callbacks ---

@@ -213,6 +213,10 @@ class OBJ2PRIM_OT_preview(bpy.types.Operator):
             prim_obj["_o2p_shape"] = result.shape_type.value
             prim_obj["_o2p_confidence"] = float(result.confidence)
             prim_obj["_o2p_method"] = result.method
+            # Cache geometry for rebuild without re-classify
+            prim_obj["_o2p_position"] = list(result.position)
+            prim_obj["_o2p_rotation"] = list(result.rotation)
+            prim_obj["_o2p_dimensions"] = list(result.dimensions)
 
             # Set up preview appearance
             _setup_preview_material(prim_obj, result.shape_type, settings.preview_opacity)
