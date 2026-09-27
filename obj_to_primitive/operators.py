@@ -147,6 +147,49 @@ def _setup_preview_material(obj, shape_type, opacity):
     obj.data.materials.append(mat)
 
 
+def _create_temp_mesh_from_edit_selection(context):
+    """Create a temporary mesh object from selected geometry in Edit Mode.
+
+    Supports multi-object editing: selected vertices and faces from all
+    objects in edit mode are merged into a single mesh in world space.
+    Returns None if nothing is selected.
+    """
+    combined_bm = bmesh.new()
+
+    for obj in context.objects_in_mode:
+        bm = bmesh.from_edit_mesh(obj.data)
+        mat = obj.matrix_world
+
+        vert_map = {}
+        for v in bm.verts:
+            if v.select:
+                new_v = combined_bm.verts.new(mat @ v.co)
+                vert_map[v.index] = new_v
+
+        combined_bm.verts.ensure_lookup_table()
+
+        for f in bm.faces:
+            if f.select:
+                try:
+                    new_verts = [vert_map[v.index] for v in f.verts]
+                    combined_bm.faces.new(new_verts)
+                except (KeyError, ValueError):
+                    pass
+
+    if not combined_bm.verts:
+        combined_bm.free()
+        return None
+
+    mesh_data = bpy.data.meshes.new("_o2p_temp_edit")
+    combined_bm.to_mesh(mesh_data)
+    combined_bm.free()
+
+    temp_obj = bpy.data.objects.new("_o2p_temp_edit", mesh_data)
+    context.collection.objects.link(temp_obj)
+
+    return temp_obj
+
+
 class OBJ2PRIM_OT_preview(bpy.types.Operator):
     """Preview: classify selected objects and overlay transparent primitives"""
     bl_idname = "obj2prim.preview"
@@ -155,14 +198,98 @@ class OBJ2PRIM_OT_preview(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
+        if context.scene.obj2prim.is_previewing:
+            return False
+        if context.mode == 'EDIT_MESH':
+            return bool(context.objects_in_mode)
         return (
             context.selected_objects
             and any(obj.type == 'MESH' for obj in context.selected_objects)
-            and not context.scene.obj2prim.is_previewing
         )
 
     def execute(self, context):
         settings = context.scene.obj2prim
+
+        if context.mode == 'EDIT_MESH':
+            return self._execute_edit_mode(context, settings)
+
+        return self._execute_object_mode(context, settings)
+
+    def _execute_edit_mode(self, context, settings):
+        """Preview from Edit Mode: classify selected geometry as one shape."""
+        # Build temp mesh from selection (while still in Edit Mode)
+        temp_obj = _create_temp_mesh_from_edit_selection(context)
+        if temp_obj is None:
+            self.report({'WARNING'}, "No vertices selected")
+            return {'CANCELLED'}
+
+        vert_count = len(temp_obj.data.vertices)
+        if vert_count < 4:
+            # Clean up temp mesh
+            temp_mesh = temp_obj.data
+            bpy.data.objects.remove(temp_obj, do_unlink=True)
+            if temp_mesh and temp_mesh.users == 0:
+                bpy.data.meshes.remove(temp_mesh)
+            self.report({'WARNING'}, f"Need at least 4 vertices (selected {vert_count})")
+            return {'CANCELLED'}
+
+        # Classify the combined selection
+        result = classify(temp_obj, settings)
+
+        # Switch to Object Mode for primitive creation
+        bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.select_all(action='DESELECT')
+
+        # Create primitive
+        if (result.shape_type == ShapeType.UNKNOWN
+                and settings.unknown_mode == 'CONVEX_HULL'):
+            prim_obj = _create_convex_hull_mesh(temp_obj)
+        else:
+            prim_obj = _create_primitive_mesh(
+                result.shape_type, result.dimensions, settings)
+
+        # Clean up temp mesh
+        temp_mesh = temp_obj.data
+        bpy.data.objects.remove(temp_obj, do_unlink=True)
+        if temp_mesh and temp_mesh.users == 0:
+            bpy.data.meshes.remove(temp_mesh)
+
+        if prim_obj is None:
+            self.report({'WARNING'}, "Failed to create primitive")
+            return {'CANCELLED'}
+
+        # Position and rotate
+        is_convex_hull = (result.shape_type == ShapeType.UNKNOWN
+                          and settings.unknown_mode == 'CONVEX_HULL')
+        if not is_convex_hull:
+            prim_obj.location = result.position
+            prim_obj.rotation_euler = Euler(result.rotation)
+
+        prim_obj.name = f"{PREVIEW_PREFIX}EditSelection"
+
+        # Store classification info (no original to reference)
+        prim_obj["_o2p_original"] = ""
+        prim_obj["_o2p_shape"] = result.shape_type.value
+        prim_obj["_o2p_confidence"] = float(result.confidence)
+        prim_obj["_o2p_method"] = result.method
+        prim_obj["_o2p_editmode"] = True
+        prim_obj["_o2p_position"] = list(result.position)
+        prim_obj["_o2p_rotation"] = list(result.rotation)
+        prim_obj["_o2p_dimensions"] = list(result.dimensions)
+
+        _setup_preview_material(prim_obj, result.shape_type, settings.preview_opacity)
+
+        self.report(
+            {'INFO'},
+            f"EditSelection → {result.shape_type.value} "
+            f"(confidence: {result.confidence}, method: {result.method})"
+        )
+
+        settings.is_previewing = True
+        return {'FINISHED'}
+
+    def _execute_object_mode(self, context, settings):
+        """Preview from Object Mode: classify each selected mesh object."""
         mesh_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
 
         if not mesh_objects:
@@ -282,15 +409,16 @@ class OBJ2PRIM_OT_confirm(bpy.types.Operator):
         for prim_obj in preview_objects:
             original_name = prim_obj.get("_o2p_original", "")
             shape_type = prim_obj.get("_o2p_shape", "UNKNOWN")
-
-            if not original_name or original_name not in bpy.data.objects:
-                continue
-
-            orig_obj = bpy.data.objects[original_name]
+            is_editmode = prim_obj.get("_o2p_editmode", False)
 
             # Rename primitive: remove preview prefix, add shape label
             label = SHAPE_LABELS.get(shape_type, "[UNK]")
-            prim_obj.name = f"{label} {original_name}"
+            if is_editmode:
+                prim_obj.name = f"{label} EditSelection"
+            else:
+                if not original_name or original_name not in bpy.data.objects:
+                    continue
+                prim_obj.name = f"{label} {original_name}"
 
             # Make primitive fully opaque
             color = get_shape_color(shape_type)
@@ -304,13 +432,15 @@ class OBJ2PRIM_OT_confirm(bpy.types.Operator):
                     if bsdf:
                         bsdf.inputs["Alpha"].default_value = 1.0
 
-            # Archive original
-            if use_collection:
-                for col in orig_obj.users_collection:
-                    col.objects.unlink(orig_obj)
-                archive_col.objects.link(orig_obj)
-            else:
-                orig_obj.hide_viewport = True
+            # Archive original (skip for Edit Mode previews)
+            if not is_editmode and original_name in bpy.data.objects:
+                orig_obj = bpy.data.objects[original_name]
+                if use_collection:
+                    for col in orig_obj.users_collection:
+                        col.objects.unlink(orig_obj)
+                    archive_col.objects.link(orig_obj)
+                else:
+                    orig_obj.hide_viewport = True
 
             # Clean up custom properties from primitive
             for key in list(prim_obj.keys()):
